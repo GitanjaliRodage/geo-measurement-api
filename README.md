@@ -1,78 +1,77 @@
 # Geospatial File Measurement API
 
-A FastAPI backend that accepts a **Shapefile (`.zip`)** or **KML** file, extracts every feature
-(ID, geometry type, geometry, CRS, attributes) and returns **area** (polygons) and **length**
-(lines), calculated in a projected, metric coordinate system, never in degrees.
+This is a backend service I built with FastAPI. You upload a Shapefile (as a `.zip`) or a KML file, and it
+gives back the area of every polygon and the length of every line in it, in metres and square metres.
 
-- Python 3.10+ · FastAPI · SQLAlchemy (SQLite by default) · GeoPandas / pyogrio (GDAL) · Shapely · pyproj
-- Interactive docs at `/docs` (Swagger UI) once the server is running
-- 46 automated tests, including known-answer checks against independent geodesic calculations
+The main thing I wanted to get right is that the numbers are actually correct. Latitude/longitude are angles,
+not distances, so I never calculate area or length on them directly. Everything is converted to a proper
+metric coordinate system first (details in the CRS section below).
+
+**Stack:** Python, FastAPI, SQLAlchemy (SQLite), GeoPandas/pyogrio, Shapely, pyproj
+
+Once it is running, the interactive API docs are at `/docs`.
 
 ---
 
 ## Setup
 
 ```bash
-git clone <your-repo-url> && cd geo-measurement-api
+git clone https://github.com/GitanjaliRodage/geo-measurement-api.git
+cd geo-measurement-api
 
 python -m venv .venv
-source .venv/bin/activate            # Windows: .venv\Scripts\activate
+source .venv/bin/activate          # on Windows: .venv\Scripts\activate
 pip install -r requirements-dev.txt
 
-uvicorn app.main:app --reload        # http://127.0.0.1:8000  (docs at /docs)
+uvicorn app.main:app --reload
 ```
 
-No system GDAL/PROJ install is needed: the `pyogrio`, `shapely` and `pyproj` wheels bundle them.
-The SQLite database (`geo_api.db`) is created automatically on first start.
+Then open http://127.0.0.1:8000/docs.
 
-**Run the tests**
+You don't need to install GDAL or PROJ separately, because the Python packages already include them.
+The SQLite database file is created automatically the first time the app starts.
+
+**Running the tests**
 
 ```bash
 pytest
 ```
 
-**Docker (optional)**
+**Try it with the sample files** in the `samples/` folder:
 
-```bash
-docker build -t geo-api .
-docker run -p 8000:8000 geo-api
-```
+- `sample_survey.kml` has a polygon, a line, a point and one `MultiGeometry` (which the API reports as unsupported instead of crashing).
+- `sample_parcels_utm43n.zip` is a Shapefile that is already in a projected CRS (EPSG:32643).
 
-**Sample files** are in `samples/` (regenerate with `python scripts/make_samples.py`):
+You can regenerate them with `python scripts/make_samples.py`.
 
-| File | What it shows |
-|---|---|
-| `sample_survey.kml` | Polygon, line, point, and a `MultiGeometry` (unsupported type handled gracefully) |
-| `sample_parcels_utm43n.zip` | Shapefile already in a projected CRS (EPSG:32643) |
+**Settings** (all optional, set as environment variables)
 
-**Configuration** (environment variables, all optional)
-
-| Variable | Default | Meaning |
+| Variable | Default | What it does |
 |---|---|---|
-| `GEO_DATABASE_URL` | `sqlite:///./geo_api.db` | Any SQLAlchemy URL (e.g. Postgres) |
-| `GEO_MAX_UPLOAD_MB` | `50` | Maximum upload size |
-| `GEO_MAX_ZIP_UNCOMPRESSED_MB` | `500` | Maximum size a zip may expand to |
-| `GEO_MAX_ZIP_MEMBERS` | `200` | Maximum number of files inside a zip |
+| `GEO_DATABASE_URL` | `sqlite:///./geo_api.db` | Database to use (any SQLAlchemy URL works, e.g. Postgres) |
+| `GEO_MAX_UPLOAD_MB` | `50` | Largest upload allowed |
+| `GEO_MAX_ZIP_UNCOMPRESSED_MB` | `500` | Largest size a zip may expand to |
+| `GEO_MAX_ZIP_MEMBERS` | `200` | Most files allowed inside a zip |
 
 ---
 
 ## API
 
-| Method | Path | Description |
+| Method | Path | What it does |
 |---|---|---|
-| `POST` | `/api/files/` | Upload and process a `.kml` or `.zip` (Shapefile) |
-| `GET` | `/api/files/{id}/` | File information and processing status |
-| `GET` | `/api/files/{id}/measurements/` | Per-feature measurements + file-level summary (paginated) |
-| `GET` | `/api/files/{id}/features/` | Per-feature geometry, CRS and attributes (paginated) |
-| `GET` | `/health` | Liveness check |
+| `POST` | `/api/files/` | Upload and process a `.kml` or a `.zip` Shapefile |
+| `GET` | `/api/files/{id}/` | File info and status |
+| `GET` | `/api/files/{id}/measurements/` | Measurements for every feature, plus totals |
+| `GET` | `/api/files/{id}/features/` | Geometry, CRS and attributes of every feature |
+| `GET` | `/health` | Simple check that the server is up |
 
-### Upload: `POST /api/files/`
+### Upload a file
 
 ```bash
 curl -X POST http://localhost:8000/api/files/ -F "file=@samples/sample_survey.kml"
 ```
 
-`201 Created`
+Response (`201 Created`):
 
 ```json
 {
@@ -89,12 +88,16 @@ curl -X POST http://localhost:8000/api/files/ -F "file=@samples/sample_survey.km
 }
 ```
 
-### File information: `GET /api/files/{id}/`
+I process the file during the upload request, so by the time you get this response the status is already `COMPLETED`
+(or `FAILED` if the file was unusable).
 
-Returns the same object as above (the shape from the assignment: `id`, `filename`, `feature_count`,
-`crs`, `status`, plus a few extra fields). `status` is `PROCESSING`, `COMPLETED` or `FAILED`.
+### Get file info
 
-### Measurements: `GET /api/files/{id}/measurements/?limit=100&offset=0`
+`GET /api/files/{id}/` returns the same object as above.
+
+### Get measurements
+
+`GET /api/files/{id}/measurements/?limit=100&offset=0`
 
 ```json
 {
@@ -125,17 +128,22 @@ Returns the same object as above (the shape from the assignment: `id`, `filename
 }
 ```
 
-All values are metric (square metres / metres). `summary` covers the **whole file**, not just the current page.
+All values are in metres or square metres. The `summary` covers the whole file, not only the page you asked for.
 
-| `status` | Meaning |
+Each feature gets one of these statuses:
+
+| Status | Meaning |
 |---|---|
-| `MEASURED` | Polygon/MultiPolygon (area, perimeter) or LineString/MultiLineString (length) |
-| `NOT_APPLICABLE` | Point/MultiPoint, valid, but nothing to measure |
-| `UNSUPPORTED` | Geometry type we don't measure (e.g. `GeometryCollection`) |
-| `EMPTY` | Feature has a null/empty geometry |
-| `ERROR` | Reprojection/calculation failed for this one feature (see `note`) |
+| `MEASURED` | Polygon or MultiPolygon (area and perimeter), or LineString or MultiLineString (length) |
+| `NOT_APPLICABLE` | Point or MultiPoint. It is valid, there is just nothing to measure |
+| `UNSUPPORTED` | A geometry type I don't measure, such as `GeometryCollection` |
+| `EMPTY` | The feature has no geometry |
+| `ERROR` | Something went wrong with this one feature (the reason is in `note`) |
 
-### Features: `GET /api/files/{id}/features/?limit=100&offset=0`
+### Get features
+
+`GET /api/files/{id}/features/?limit=100&offset=0` returns each feature's index, geometry type, geometry (GeoJSON),
+CRS and its attributes:
 
 ```json
 {
@@ -152,141 +160,168 @@ All values are metric (square metres / metres). `summary` covers the **whole fil
 }
 ```
 
-`geometry` is GeoJSON in the **file's original CRS** (stated in `crs`); Z values are dropped.
+The geometry is returned in the file's original CRS (the `crs` field tells you which). Z values are dropped.
 
 ### Errors
 
-| Code | When |
+| Code | When it happens |
 |---|---|
-| `404` | Unknown file id |
-| `409` | Results requested for a file whose status is not `COMPLETED` |
-| `413` | Upload larger than `GEO_MAX_UPLOAD_MB` |
-| `415` | Not a `.kml` / `.zip` |
-| `422` | File is unreadable (corrupt zip, no `.shp`, more than one Shapefile, no CRS, invalid/empty KML, zip too large when expanded). The file is recorded with status `FAILED` and the response body contains its `id` and a clear `message` |
+| `404` | The file id doesn't exist |
+| `409` | You asked for results of a file that isn't `COMPLETED` |
+| `413` | The upload is bigger than the limit |
+| `415` | The file isn't a `.kml` or `.zip` |
+| `422` | The file can't be read: corrupt zip, no `.shp` inside, more than one Shapefile, no CRS, broken or empty KML. The file is saved with status `FAILED` and the response includes its `id` and a clear message |
 
 ---
 
 ## Architecture
 
-### Application structure
+### How the code is organised
 
 ```
 app/
-  main.py              FastAPI app, router registration, DB init on startup
-  config.py            Settings (env-driven)
-  database.py          Engine / session / get_db dependency
-  models.py            UploadedFile, Feature (SQLAlchemy)
-  schemas.py           Pydantic response models
-  api/files.py         HTTP layer: validation of the upload, endpoints, error mapping
+  main.py              creates the FastAPI app
+  config.py            settings
+  database.py          database connection
+  models.py            two tables: UploadedFile and Feature
+  schemas.py           response models
+  api/files.py         the endpoints
   services/
-    parser.py          Zip extraction + reading KML/Shapefile into plain Python objects
-    crs.py             CRS labelling, UTM zone selection, Projector (reprojection)
-    measurements.py    Pure functions: geometry in WGS84 -> Measurement
-    ingest.py          Orchestrates parse -> reproject -> measure -> persist
-tests/                 Unit tests (CRS/measurement) + API tests with real generated files
+    parser.py          reads KML and zipped Shapefiles
+    crs.py             CRS names, UTM zone choice, reprojection
+    measurements.py    works out area and length
+    ingest.py          ties parsing, measuring and saving together
+tests/                 unit tests and API tests
 scripts/make_samples.py
 ```
 
-The HTTP layer knows nothing about GDAL or projections; the services know nothing about HTTP.
-`measurements.py` is pure (no I/O), which is why it is easy to unit test against known answers.
+I kept the web layer (`api/`) separate from the geospatial logic (`services/`). The endpoints don't know anything
+about GDAL or projections, and `measurements.py` doesn't do any I/O, which made it easy to test with shapes whose
+correct answer I already knew.
 
-### File-processing flow
+### What happens when you upload a file
 
-1. `POST /api/files/` checks the extension, streams the body to a temp directory while enforcing the size limit.
-2. A `files` row is created with status `PROCESSING`.
-3. **Shapefile:** the zip is safely extracted (see *Security*), exactly one `.shp` is required, and the `.prj` must yield a CRS.
-   **KML:** every Folder (GDAL layer) is read and concatenated; CRS is WGS84 by definition of KML.
-4. Each feature becomes `(index, 2D geometry, JSON-safe attributes)`.
-5. Each feature is reprojected and measured (below). A failure on one feature is caught and stored as `ERROR`; it never fails the file.
-6. All feature rows are inserted in batches and the file is marked `COMPLETED` **in one transaction**, so a file is never stored half-processed.
-7. If the file is unusable, the file row is marked `FAILED` with the reason and the API returns `422`.
-8. The temp directory (including the uploaded file) is deleted; only the extracted data is kept.
+1. The endpoint checks the extension and saves the upload to a temporary folder, stopping if it is too large.
+2. A row is created in the database with status `PROCESSING`.
+3. **Shapefile:** the zip is extracted safely. It must contain exactly one `.shp`, and the `.prj` must give a CRS.
+   **KML:** every folder in the KML is read, and the CRS is WGS84 (that is what KML always uses).
+4. Each feature is turned into an index, a 2D geometry and its attributes.
+5. Each feature is reprojected and measured. If one feature fails, it is stored with status `ERROR`
+   and the rest of the file carries on.
+6. All the features are saved and the file is marked `COMPLETED` in a single transaction, so a file is never
+   left half-saved.
+7. If the file can't be used at all, it is marked `FAILED` with the reason and the API returns `422`.
+8. The temporary folder, including the uploaded file, is deleted.
 
-### Measurement-calculation flow
+### How a measurement is calculated
 
 ```
-geometry (source CRS)
-   │  force 2D
-   ▼
-reproject → WGS84 (lon/lat)         ← skipped if already WGS84
-   │  representative_point() → pick UTM zone
-   ▼
-reproject → UTM zone (metres)
-   │
-   ├─ Polygon / MultiPolygon        → area, perimeter  (holes are subtracted; parts summed)
-   ├─ LineString / MultiLineString  → length
-   ├─ Point / MultiPoint            → NOT_APPLICABLE
-   └─ anything else / empty         → UNSUPPORTED / EMPTY
+geometry in the file's own CRS
+   ↓  drop Z values
+convert to WGS84 (lon/lat)             (skipped if it already is WGS84)
+   ↓  take a point inside the shape, find its UTM zone
+convert to that UTM zone (metres)
+   ↓
+Polygon / MultiPolygon        → area and perimeter (holes are subtracted)
+LineString / MultiLineString  → length
+Point / MultiPoint            → NOT_APPLICABLE
+anything else, or empty       → UNSUPPORTED / EMPTY
 ```
 
-### CRS handling
+### How I handle CRS
 
-Area and distance are never computed on latitude/longitude degrees (1° of longitude is ~111 km at the
-equator and ~0 km at the poles, so "square degrees" mean nothing).
+- The source CRS comes from the file: the `.prj` for a Shapefile, WGS84 for KML. It is reported as `EPSG:xxxx`
+  whenever it can be identified.
+- Everything is first converted to WGS84, then to the UTM zone of the feature (`EPSG:326xx` in the northern
+  hemisphere, `EPSG:327xx` in the southern). Near the poles (north of 84°N or south of 80°S) UTM isn't defined,
+  so I use the polar stereographic systems (`EPSG:32661` / `EPSG:32761`) instead.
+- The zone is picked per feature, so a file that spreads over several zones is still handled sensibly.
+- Every measurement says which zone was used (`projected_crs`), so you can see how it was computed.
+- A Shapefile with no CRS is rejected. I preferred that over guessing and returning wrong numbers.
+- If the converted coordinates fall outside the valid lat/lon range, that usually means the CRS in the file is wrong,
+  so that feature is marked `ERROR`.
 
-- **Source CRS** is read from the file (`.prj` for Shapefile; WGS84 for KML) and reported as `EPSG:xxxx` when it can be identified.
-- Everything is normalised to WGS84 first, then projected to the **UTM zone of the feature's representative point**
-  (`EPSG:326xx` north / `EPSG:327xx` south). Polar features (north of 84°N / south of 80°S, where UTM is undefined)
-  use UPS (`EPSG:32661` / `EPSG:32761`).
-- The zone is chosen **per feature**, so a file spanning several zones is still measured in each feature's best-fit zone.
-- The zone used is returned for each measurement as `projected_crs`, so results are auditable.
-- A Shapefile with no CRS is rejected (422) rather than guessed.
-- Coordinates outside lon/lat range after conversion (a sign the CRS in the file is wrong) are flagged as `ERROR` for that feature.
-
-**How correctness is verified:** tests compare results with `pyproj.Geod` (true ellipsoidal geodesic area/length)
-to within 0.1%, check a 1000 m × 1000 m square in UTM equals exactly 1,000,000 m², and check that the same shape
-uploaded in EPSG:32643 and in EPSG:4326 gives the same area. Deliberately removing the projection step makes 7 tests fail.
+**How I checked it is correct:** I compare my results with `pyproj.Geod`, which computes true distances and areas on
+the ellipsoid, and they match within 0.1%. I also test a 1000 m × 1000 m square in UTM, which must come out as exactly
+1,000,000 m², and I upload the same shape once in EPSG:32643 and once in EPSG:4326 to make sure both give the same area.
+To be sure the tests really protect this logic, I temporarily removed the projection step and 7 tests failed.
 
 ---
 
 ## Design decisions
 
-| Decision | Why | Alternatives considered |
-|---|---|---|
-| **FastAPI** | Typed request/response models, automatic OpenAPI docs, simple file upload handling. | Django + DRF: more batteries (admin, ORM), but heavier for a small, API-only service. |
-| **Synchronous processing** (result is ready when the POST returns) | Parsing and measuring is fast (tens of ms for the samples) and the API contract in the brief (upload → get) is simplest this way. Endpoints are plain `def`, so FastAPI runs them in a thread pool and the event loop isn't blocked. | Background job (Celery/RQ/`BackgroundTasks`) with `PROCESSING` polling. Better for huge files; the `status` field and the `PROCESSING` state are already in place so this is an incremental change. |
-| **Projected CRS = UTM zone per feature** | Accurate (distortion well under 0.1% inside a zone), metric, trivially computed from a coordinate, no external lookup. | One CRS for the whole file (simpler, but wrong for files spanning zones). Geodesic calculation with `pyproj.Geod` (most accurate, no zones, but the brief asks for projection; I use it in tests as the independent check). Equal-area projections such as EPSG:6933 (great for area, poor for length). |
-| **Always go through WGS84** | One code path for any input CRS; avoids measuring in a CRS that is itself distorted (e.g. Web Mercator inflates areas heavily away from the equator). | Measure directly in the source CRS when it is projected: faster but trusts arbitrary local projections. |
-| **GeoPandas/pyogrio (GDAL) for reading** | One reader for Shapefile and KML, handles encodings, `.prj` parsing and KML folders. | `fastkml` + `pyshp`: lighter, but two code paths and more edge cases to maintain. |
-| **Store features + measurements in a DB** | `GET` endpoints are cheap, paginated, and survive restarts. Measurements are computed once. | Recompute on every request (no storage, but wasteful and non-paginatable). |
-| **SQLite default, SQLAlchemy** | Zero setup for reviewers; switch to Postgres by changing `GEO_DATABASE_URL`. | PostGIS: would enable spatial queries, not needed for this scope. |
-| **Unsupported / empty / failing features get a status instead of an error** | The brief asks for graceful handling: one `GeometryCollection` must not make the rest of a 10,000-feature file unusable. | Reject the whole file (loses good data). |
-| **Geometry stored in source CRS** | Faithful to the upload; `crs` field says how to interpret it. | Always return WGS84 GeoJSON (spec-compliant GeoJSON, but silently changes the user's data). |
-| **One Shapefile per zip** | Avoids ambiguous CRS/feature indexing across layers. | Merge multiple Shapefiles: possible future work. |
+**FastAPI instead of Django.** The project is a small API with no admin pages or templates, so FastAPI's type
+checking, automatic docs and simple file uploads were a better fit than Django REST Framework.
 
-### Security notes
+**Processing during the upload request, not in the background.** The files in this assignment are processed in tens of
+milliseconds, and "upload, then get results" is the simplest contract. Endpoints are normal `def` functions, so FastAPI
+runs them in a thread pool and doesn't block other requests. For very large files I would move this to a job queue
+(for example Celery with Redis). The `PROCESSING` status already exists for that.
 
-- Zip members are **never extracted by archive path** (no zip-slip): only known Shapefile extensions are written, to fixed names inside a temp directory.
-- Zip expansion is capped **while streaming**, not by trusting header sizes, and file count is capped (zip bombs).
-- Upload size is capped while streaming to disk; the file is never fully loaded in memory.
-- Temp files are always removed (`TemporaryDirectory`).
+**UTM zone for each feature.** It is accurate (distortion is well under 0.1% inside a zone), it works in metres,
+and the zone can be worked out from a single coordinate with no lookup. I considered:
+- one CRS for the whole file, which is simpler but wrong for files that cross zones;
+- measuring directly on the ellipsoid with `pyproj.Geod`, which is the most accurate, but the assignment asks for projection, so I use it as an independent check in the tests;
+- equal-area projections like EPSG:6933, which are great for area but not for length.
 
-### Known limitations
+**Always going through WGS84 first.** One code path handles any input CRS, and I avoid measuring in a CRS that is
+itself distorted (Web Mercator, for example, inflates areas a lot away from the equator).
 
-- `GeometryCollection` / KML `MultiGeometry` features are reported as `UNSUPPORTED` rather than measured part by part.
-- Features crossing the antimeridian (±180°) or spanning more than one UTM zone are measured in the zone of their representative point, which is slightly less accurate than a geodesic calculation.
-- Z values are discarded; measurements are planimetric (2D).
-- `.kmz` and multi-layer Shapefile archives are not accepted.
-- No authentication or rate limiting.
+**GeoPandas/pyogrio for reading.** One reader handles both Shapefile and KML, including `.prj` parsing and
+KML folders. Using `fastkml` and `pyshp` would have meant two separate code paths.
+
+**Saving results in a database.** Measurements are calculated once, and the GET endpoints are cheap, paginated and
+survive restarts. SQLite works with no setup, and changing `GEO_DATABASE_URL` is enough to move to Postgres.
+
+**Unsupported or broken features get a status instead of an error.** One `GeometryCollection` shouldn't make the
+other 9,999 features in a file unusable.
+
+**Geometry is returned in the file's original CRS.** I didn't want to silently change the user's data. The `crs` field
+says how to read the coordinates.
+
+**One Shapefile per zip.** Merging several would raise questions about mixed CRSs and feature numbering.
+
+### Security
+
+- Files inside a zip are never extracted using their path from the archive, which prevents zip-slip. Only known Shapefile
+  extensions are written, to fixed names in a temporary folder.
+- The size a zip expands to is checked while extracting, not by trusting the size written in the header, and the number
+  of files is limited too (protection against zip bombs).
+- Uploads are streamed to disk with a size limit, so a big file is never loaded fully into memory.
+- Temporary files are always cleaned up.
+
+### Limitations I know about
+
+- `GeometryCollection` and KML `MultiGeometry` features are reported as `UNSUPPORTED` instead of being measured part by part.
+- Features that cross the antimeridian (±180°) or span more than one UTM zone are measured in the zone of one
+  representative point, which is slightly less accurate than a full geodesic calculation.
+- Z values are discarded, so all measurements are 2D.
+- `.kmz` files and zips with several Shapefiles are not accepted.
+- There is no authentication or rate limiting.
 
 ---
 
-## Learning
+## What I learned
 
-*(Replace with your own words before submitting: interviewers will ask about this.)*
+- **Degrees are not distances.** One degree of longitude is about 111 km at the equator and shrinks towards the
+  poles, so "area in square degrees" is meaningless. This was the biggest lesson, and the whole design comes from it.
+- **Geographic vs projected CRS.** EPSG:4326 stores positions as angles. A projected CRS like UTM stores them in metres,
+  which is what you need to measure. Learning how a UTM zone follows from a longitude was really useful.
+- **Not all projections are good for measuring.** Web Mercator is great for web maps but distorts area badly.
+- **How to test geospatial code.** Because there is no "obvious" answer, I used independent checks: true geodesic
+  calculations, shapes with a known exact answer, and comparing the same shape in two different CRSs. I also broke the
+  code on purpose to make sure the tests would catch it.
+- **Dealing with untrusted uploads.** Zip-slip, zip bombs and size limits were new to me, and now I check for them whenever
+  I accept a file.
+- **Designing for partial failure.** Giving each feature its own status is much more useful to a client than failing
+  the whole file because of one bad feature.
 
-- Why degrees can't be used for area/length, and how UTM zones are derived from longitude/latitude.
-- The difference between a *geographic* CRS (EPSG:4326) and a *projected* CRS, and why Web Mercator is a poor choice for measuring.
-- How to verify geospatial code: independent geodesic calculations, exact known-answer shapes, and round-trip checks between CRSs.
-- Handling untrusted archives safely (zip-slip, decompression bombs) and streaming uploads.
-- Designing for partial failure: per-feature status instead of all-or-nothing.
+## What I would do next
 
-## Future scope
-
-- **Async processing** with a job queue (Celery/RQ + Redis) and progress reporting for very large files; the `PROCESSING` status is already modelled.
-- Measure `GeometryCollection` / `MultiGeometry` part by part.
-- Geodesic measurement option (`?method=geodesic`) and a choice of output units (ha, acres, km, miles).
-- `.kmz`, GeoJSON, GeoPackage and multi-layer archive support.
-- PostGIS storage for spatial queries (bounding-box filter, intersects).
-- Authentication, per-user files, retention/cleanup of old records, and `DELETE /api/files/{id}/`.
-- Alembic migrations, structured logging, metrics, and CI (GitHub Actions running `pytest`).
+- Move processing to a background job queue (Celery or RQ with Redis) with progress reporting for very large files.
+- Measure `GeometryCollection` and `MultiGeometry` features part by part.
+- Add an option for geodesic measurement and for choosing units (hectares, acres, kilometres, miles).
+- Support `.kmz`, GeoJSON, GeoPackage and zips with several layers.
+- Use PostGIS so features can be queried spatially (for example by bounding box).
+- Add authentication, file cleanup and a `DELETE` endpoint.
+- Add database migrations with Alembic, structured logging and a GitHub Actions workflow that runs the tests.
